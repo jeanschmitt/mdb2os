@@ -8,19 +8,21 @@ import (
 )
 
 func (e *ETL) Sync(ctx context.Context) (bson.Raw, error) {
+	e.Logger.Info("Running Sync")
+
 	resumeToken, err := e.obtainResumeToken(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate resume token: %w", err)
 	}
 
 	existingIDs, err := e.FindAllIds(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to retrieve all existing ids: %w", err)
 	}
 
 	mongoIDs, err := e.indexAllDocuments(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to index new documents: %w", err)
 	}
 
 	for _, toDelete := range extraItems(mongoIDs, existingIDs) {
@@ -28,6 +30,8 @@ func (e *ETL) Sync(ctx context.Context) (bson.Raw, error) {
 			ID: toDelete,
 		})
 	}
+
+	e.Logger.Info("Sync finished")
 
 	return resumeToken, nil
 }

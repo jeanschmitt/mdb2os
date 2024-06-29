@@ -2,6 +2,7 @@ package mdb2os
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/opensearch-project/opensearch-go"
@@ -19,12 +20,31 @@ type ETL struct {
 }
 
 type Config struct {
-	CollectionName     string
-	IndexName          string
-	ResumeAfter        bson.Raw
+	// Name of the MongoDB collection to watch.
+	CollectionName string
+
+	// Name of the target OpenSearch index.
+	IndexName string
+
+	// Watch the MongoDB collection after this resume token.
+	//
+	// If provided, the Sync procedure will be skipped.
+	ResumeAfter bson.Raw
+
+	// Duration of the OpenSearch scroll used in the Sync procedure (default: 2 minutes).
 	SyncScrollDuration time.Duration
-	SyncBatchSize      int
-	Logger             Logger
+
+	// Batch size of the OpenSearch scroll used in the Sync procedure (default: 10000).
+	SyncBatchSize int
+
+	// If > 1, OpenSearch writes will use the Bulk API, with batches of max BulkBatchSize operations.
+	BulkBatchSize int
+
+	// If > 0, Bulk write batches will be sent after BulkBatchTTL, even if they are not full.
+	BulkBatchTTL time.Duration
+
+	// Logger to use (default: a NoopLogger).
+	Logger Logger
 }
 
 func (cfg *Config) SetDefaults() {
@@ -50,7 +70,7 @@ func NewETL(
 		Config:     cfg,
 		OpenSearch: openSearchClient,
 		Coll:       mongoDB.Collection(cfg.CollectionName),
-		osChan:     make(chan OpenSearchOperation),
+		osChan:     make(chan OpenSearchOperation, cfg.BulkBatchSize),
 	}
 }
 
@@ -62,7 +82,7 @@ func (e *ETL) Run(ctx context.Context) error {
 	if e.ResumeAfter == nil {
 		var err error
 		if e.ResumeAfter, err = e.Sync(ctx); err != nil {
-			return err
+			return fmt.Errorf("failed to sync: %w", err)
 		}
 	}
 

@@ -15,13 +15,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 )
 
+// IndexDocument indexes a single OpenSearch document.
 func (e *ETL) IndexDocument(ctx context.Context, id string, document bson.M) error {
-	source := OpenSearchSource{
-		Document: document,
-		Time:     time.Now(),
-	}
-
-	jsonDoc, err := json.Marshal(source)
+	source, err := newSource(document)
 	if err != nil {
 		return err
 	}
@@ -29,22 +25,18 @@ func (e *ETL) IndexDocument(ctx context.Context, id string, document bson.M) err
 	_, err = e.executeOpenSearchRequest(ctx, opensearchapi.IndexRequest{
 		Index:      e.IndexName,
 		DocumentID: id,
-		Body:       bytes.NewReader(jsonDoc),
+		Body:       bytes.NewReader(source),
 	})
 	if err != nil {
 		return err
 	}
 
-	e.Logger.Info(fmt.Sprintf("Indexed document %q: %s", id, string(jsonDoc)))
+	e.Logger.Info(fmt.Sprintf("Indexed document %q", id))
 
 	return nil
 }
 
-type OpenSearchSource struct {
-	Document any       `json:"document"`
-	Time     time.Time `json:"time"`
-}
-
+// DeleteDocument deletes a single OpenSearch document.
 func (e *ETL) DeleteDocument(ctx context.Context, id string) error {
 	_, err := e.executeOpenSearchRequest(ctx, opensearchapi.DeleteRequest{
 		Index:      e.IndexName,
@@ -57,6 +49,104 @@ func (e *ETL) DeleteDocument(ctx context.Context, id string) error {
 	e.Logger.Info(fmt.Sprintf("Deleted document %q", id))
 
 	return nil
+}
+
+// BulkWrite sends a Bulk operation to OpenSearch, with the given operations batch.
+func (e *ETL) BulkWrite(ctx context.Context, batch []OpenSearchOperation) error {
+	body, err := newBulkBody(batch)
+	if err != nil {
+		return fmt.Errorf("failed to build bulk body: %w", err)
+	}
+
+	bulkRes, err := e.executeOpenSearchRequest(ctx, opensearchapi.BulkRequest{
+		Index: e.IndexName,
+		Body:  body,
+	})
+	if err != nil {
+		return fmt.Errorf("failed send bulk request: %w", err)
+	}
+
+	if _, isNoopLogger := e.Logger.(NoopLogger); !isNoopLogger {
+		var parsedRes BulkResponse
+		err = json.Unmarshal(bulkRes, &parsedRes)
+		if err != nil {
+			return fmt.Errorf("could not parse bulk response: %w", err)
+		}
+
+		for _, op := range parsedRes.Items {
+			if op.Index != nil {
+				if op.Index.Error != nil {
+					e.Logger.Error(fmt.Sprintf("Failed to index document %s: %v", op.Index.ID, op.Index.Error))
+				} else {
+					e.Logger.Info(fmt.Sprintf("Indexed document %s", op.Index.ID))
+				}
+			}
+			if op.Delete != nil {
+				if op.Delete.Error != nil {
+					e.Logger.Error(fmt.Sprintf("Failed to delete document %s: %v", op.Delete.ID, op.Delete.Error))
+				} else {
+					e.Logger.Info(fmt.Sprintf("Deleted document %s", op.Delete.ID))
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func newBulkBody(batch []OpenSearchOperation) (*bytes.Buffer, error) {
+	body := new(bytes.Buffer)
+
+	for _, op := range batch {
+		switch op := op.(type) {
+		case IndexDocument:
+			source, err := newSource(op.Document)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal document %s: %w", op.ID, err)
+			}
+
+			body.WriteString(fmt.Sprintf("{\"index\":{\"_id\":%q}}\n", op.ID))
+			body.Write(source)
+
+		case DeleteDocument:
+			body.WriteString(fmt.Sprintf("{\"delete\":{\"_id\":%q}}", op.ID))
+		}
+
+		body.WriteByte('\n')
+	}
+
+	return body, nil
+}
+
+func newSource(document map[string]any) ([]byte, error) {
+	source := OpenSearchSource{
+		Document: document,
+		Time:     time.Now(),
+	}
+
+	return json.Marshal(source)
+}
+
+type BulkResponse struct {
+	Items []struct {
+		Index  *BulkOperationResult `json:"index"`
+		Delete *BulkOperationResult `json:"delete"`
+	} `json:"items"`
+}
+
+type BulkOperationResult struct {
+	ID    string              `json:"_id"`
+	Error *BulkOperationError `json:"error"`
+}
+
+type BulkOperationError struct {
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
+}
+
+type OpenSearchSource struct {
+	Document any       `json:"document"`
+	Time     time.Time `json:"time"`
 }
 
 func (e *ETL) FindAllIds(ctx context.Context) ([]string, error) {
@@ -153,17 +243,29 @@ func (e *ETL) EnqueueOperation(op OpenSearchOperation) {
 }
 
 func (e *ETL) runOpenSearchWorker(ctx context.Context) error {
+	if e.BulkBatchSize <= 1 {
+		return e.openSearchWorkerNoBatch(ctx)
+	}
+
+	if e.BulkBatchSize <= 0 {
+		return e.openSearchWorkerNoTTL(ctx)
+	}
+
+	return e.batchedOpenSearchWorker(ctx)
+}
+
+func (e *ETL) openSearchWorkerNoBatch(ctx context.Context) error {
 	for {
 		select {
 		case op := <-e.osChan:
 			switch op := op.(type) {
 			case IndexDocument:
 				if err := e.IndexDocument(ctx, op.ID, op.Document); err != nil {
-					// LOG
+					e.Logger.Error(fmt.Sprintf("Failed to index document %s: %v", op.ID, err))
 				}
 			case DeleteDocument:
 				if err := e.DeleteDocument(ctx, op.ID); err != nil {
-					// LOG
+					e.Logger.Error(fmt.Sprintf("Failed to delete document %s: %v", op.ID, err))
 				}
 			}
 		case <-ctx.Done():
@@ -171,6 +273,67 @@ func (e *ETL) runOpenSearchWorker(ctx context.Context) error {
 		}
 	}
 }
+
+func (e *ETL) openSearchWorkerNoTTL(ctx context.Context) error {
+	for {
+		batch := make([]OpenSearchOperation, 0, e.BulkBatchSize)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case op, ok := <-e.osChan:
+				if !ok {
+					return ErrChanClosed
+				}
+
+				batch = append(batch, op)
+				if len(batch) == e.BulkBatchSize {
+					if err := e.BulkWrite(ctx, batch); err != nil {
+						e.Logger.Error(fmt.Sprintf("Failed to bulk write: %v", err))
+					}
+				}
+			}
+		}
+	}
+}
+
+func (e *ETL) batchedOpenSearchWorker(ctx context.Context) error {
+	for {
+		batch := make([]OpenSearchOperation, 0, e.BulkBatchSize)
+		after := time.After(e.BulkBatchTTL)
+
+	batchLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case op, ok := <-e.osChan:
+				if !ok {
+					return ErrChanClosed
+				}
+
+				batch = append(batch, op)
+				if len(batch) == e.BulkBatchSize {
+					break batchLoop
+				}
+
+			case <-after:
+				break batchLoop
+			}
+		}
+
+		if len(batch) > 0 {
+			if err := e.BulkWrite(ctx, batch); err != nil {
+				e.Logger.Error(fmt.Sprintf("Failed to bulk write: %v", err))
+			}
+		}
+	}
+}
+
+var ErrChanClosed = errors.New("channel closed")
 
 type OpenSearchOperation interface {
 	IsOpenSearchOperation()

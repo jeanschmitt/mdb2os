@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// Watch the configured MongoDB collection, enqueuing OpenSearch operations when a change is detected.
 func (e *ETL) Watch(ctx context.Context) error {
 	stream, err := openChangeStream(ctx, e.Coll, e.ResumeAfter)
 	if err != nil {
