@@ -12,7 +12,7 @@ import (
 
 // Watch the configured MongoDB collection, enqueuing OpenSearch operations when a change is detected.
 func (e *ETL) Watch(ctx context.Context) error {
-	stream, err := openChangeStream(ctx, e.Coll, e.ResumeAfter)
+	stream, err := openChangeStream(ctx, e.Coll, e.Filter, e.ResumeAfter)
 	if err != nil {
 		return err
 	}
@@ -33,12 +33,20 @@ func (e *ETL) Watch(ctx context.Context) error {
 	return stream.Err()
 }
 
-func openChangeStream(ctx context.Context, coll *mongo.Collection, resumeAfter any) (*mongo.ChangeStream, error) {
-	return coll.Watch(ctx, mongo.Pipeline{
-		{{"$match", bson.M{
-			"operationType": bson.M{"$in": SupportedOperationTypes},
-		}}},
-	},
+func openChangeStream(ctx context.Context, coll *mongo.Collection, filter, resumeAfter any) (*mongo.ChangeStream, error) {
+	pipeline := make(mongo.Pipeline, 0, 2)
+
+	if filter != nil {
+		pipeline = append(pipeline, bson.D{{"$match", bson.M{
+			"fullDocument": filter,
+		}}})
+	}
+
+	pipeline = append(pipeline, bson.D{{"$match", bson.M{
+		"operationType": bson.M{"$in": SupportedOperationTypes},
+	}}})
+
+	return coll.Watch(ctx, pipeline,
 		options.ChangeStream().
 			SetFullDocument(options.UpdateLookup).
 			SetResumeAfter(resumeAfter),

@@ -37,7 +37,7 @@ func (e *ETL) Sync(ctx context.Context) (bson.Raw, error) {
 }
 
 func (e *ETL) obtainResumeToken(ctx context.Context) (bson.Raw, error) {
-	stream, err := openChangeStream(ctx, e.Coll, nil)
+	stream, err := openChangeStream(ctx, e.Coll, e.Filter, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +50,12 @@ func (e *ETL) obtainResumeToken(ctx context.Context) (bson.Raw, error) {
 func (e *ETL) indexAllDocuments(ctx context.Context) (map[string]struct{}, error) {
 	idSet := make(map[string]struct{})
 
-	cursor, err := e.Coll.Find(ctx, bson.D{})
+	filter := e.Filter
+	if e.Filter == nil {
+		filter = bson.D{}
+	}
+
+	cursor, err := e.Coll.Find(ctx, filter)
 	if err != nil {
 		return nil, err
 	}

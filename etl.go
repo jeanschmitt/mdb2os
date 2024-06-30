@@ -26,6 +26,9 @@ type Config struct {
 	// Name of the target OpenSearch index.
 	IndexName string
 
+	// Match filter use when watching documents from the MongoDB collection.
+	Filter any
+
 	// Watch the MongoDB collection after this resume token.
 	//
 	// If provided, the Sync procedure will be skipped.
