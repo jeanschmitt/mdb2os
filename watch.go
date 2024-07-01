@@ -6,13 +6,14 @@ import (
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsonrw"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // Watch the configured MongoDB collection, enqueuing OpenSearch operations when a change is detected.
 func (e *ETL) Watch(ctx context.Context) error {
-	stream, err := openChangeStream(ctx, e.Coll, e.Filter, e.ResumeAfter)
+	stream, err := openChangeStream(ctx, e.Coll, e.WatchPipeline, e.ResumeAfter)
 	if err != nil {
 		return err
 	}
@@ -21,7 +22,7 @@ func (e *ETL) Watch(ctx context.Context) error {
 
 	for stream.Next(ctx) {
 		var ev ChangeEvent
-		if err = stream.Decode(&ev); err != nil {
+		if err = e.decodeCursorOrChangeStream(stream, stream.Current, &ev); err != nil {
 			return err
 		}
 
@@ -33,15 +34,28 @@ func (e *ETL) Watch(ctx context.Context) error {
 	return stream.Err()
 }
 
-func openChangeStream(ctx context.Context, coll *mongo.Collection, filter, resumeAfter any) (*mongo.ChangeStream, error) {
-	pipeline := make(mongo.Pipeline, 0, 2)
+type cursorOrChangeStream interface {
+	Decode(val any) error
+}
 
-	if filter != nil {
-		pipeline = append(pipeline, bson.D{{"$match", bson.M{
-			"fullDocument": filter,
-		}}})
+func (e *ETL) decodeCursorOrChangeStream(c cursorOrChangeStream, raw bson.Raw, val any) error {
+	if e.TransformRegistry == nil {
+		return c.Decode(val)
 	}
 
+	dec, err := bson.NewDecoder(bsonrw.NewBSONDocumentReader(raw))
+	if err != nil {
+		return fmt.Errorf("failed to create decoder: %w", err)
+	}
+
+	if err = dec.SetRegistry(e.TransformRegistry); err != nil {
+		return fmt.Errorf("failed to set decoder registry: %w", err)
+	}
+
+	return dec.Decode(val)
+}
+
+func openChangeStream(ctx context.Context, coll *mongo.Collection, pipeline mongo.Pipeline, resumeAfter any) (*mongo.ChangeStream, error) {
 	pipeline = append(pipeline, bson.D{{"$match", bson.M{
 		"operationType": bson.M{"$in": SupportedOperationTypes},
 	}}})
